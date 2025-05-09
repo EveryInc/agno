@@ -181,7 +181,7 @@ class TeamGetResponse(BaseModel):
                 provider=team.model.provider or team.model.__class__.__name__ if team.model else None,
             ),
             success_criteria=team.success_criteria,
-            instructions=team.instructions,
+            instructions="",
             description=team.description,
             expected_output=team.expected_output,
             context=json.dumps(team.context) if isinstance(team.context, dict) else team.context,
