@@ -6281,6 +6281,213 @@ class Team:
         except Exception as e:
             log_warning(f"Failed to retrieve session state history: {e}")
             return []
+    
+    def create_session_from_history(self, source_session_id: str, run_id: str) -> Optional[str]:
+        """Create a new session from an existing session up to a specific run ID.
+        
+        This method creates a new session with the same team configuration as the source session,
+        but with the state as it was at the specified run_id. The new session will be completely
+        independent from the original session.
+        
+        Args:
+            source_session_id (str): The ID of the source session to branch from.
+            run_id (str): The run ID up to which to copy the session state.
+            
+        Returns:
+            Optional[str]: The ID of the newly created session, or None if creation failed.
+            
+        Raises:
+            ValueError: If session state history is not enabled or if the source session is not found.
+        """
+        if not self.enable_session_state_history:
+            raise ValueError("Session state history must be enabled to create a session from history")
+            
+        if self.storage is None:
+            log_warning("Storage is not configured, cannot create session from history")
+            return None
+            
+        # Read the source session
+        source_session = cast(TeamSession, self.storage.read(session_id=source_session_id))
+        if source_session is None:
+            raise ValueError(f"Source session with ID {source_session_id} not found")
+            
+        # Get the session state history for the source session
+        history = self.storage.get_session_state_history(session_id=source_session_id)
+        if not history:
+            log_warning(f"No session state history found for session {source_session_id}")
+            return None
+            
+        # Find the state corresponding to the specified run_id
+        target_state = None
+        target_index = -1
+        for i, entry in enumerate(history):
+            if entry["run_id"] == run_id:
+                target_state = entry["state"]
+                target_index = i
+                break
+                
+        if target_state is None:
+            raise ValueError(f"No state found for run ID {run_id} in session {source_session_id}")
+            
+        # Generate a new session ID
+        from uuid import uuid4
+        new_session_id = str(uuid4())
+        
+        # Store the current session state, ID, and memory
+        original_session_id = self.session_id
+        original_session_state = self.session_state
+        original_memory = None
+        
+        # If we have a memory object, we need to handle it specially
+        if self.memory is not None:
+            from copy import deepcopy
+            
+            # Make a deep copy of the memory to preserve the original
+            original_memory = deepcopy(self.memory)
+            
+            # Find the target run to get its timestamp
+            target_run = None
+            run_id_attr = None  # Track which attribute matched for consistency
+            
+            if hasattr(self.memory, 'runs') and isinstance(self.memory.runs, dict):
+                source_runs = self.memory.runs.get(source_session_id, [])
+                
+                # First pass: try to find the exact run ID match
+                for run in source_runs:
+                    # Check both 'id' and 'run_id' attributes since different run objects might use different naming
+                    if hasattr(run, 'id') and run.id == run_id:
+                        target_run = run
+                        run_id_attr = 'id'
+                        break
+                    elif hasattr(run, 'run_id') and run.run_id == run_id:
+                        target_run = run
+                        run_id_attr = 'run_id'
+                        break
+                
+                # If we didn't find the run, log details and try partial matching
+                if target_run is None:
+                    # Collect all available run IDs for debugging
+                    run_ids = []
+                    for run in source_runs:
+                        if hasattr(run, 'id'):
+                            run_ids.append(f"id:{run.id}")
+                        if hasattr(run, 'run_id'):
+                            run_ids.append(f"run_id:{run.run_id}")
+                    
+                    log_debug(f"Available run IDs: {run_ids}")
+                    log_debug(f"Looking for run ID: {run_id}")
+                    
+                    # Try partial matching as a fallback
+                    for run in source_runs:
+                        if hasattr(run, 'id') and str(run.id).startswith(run_id):
+                            target_run = run
+                            run_id_attr = 'id'
+                            log_debug(f"Found partial match for run ID {run_id} -> {run.id}")
+                            break
+                        elif hasattr(run, 'run_id') and str(run.run_id).startswith(run_id):
+                            target_run = run
+                            run_id_attr = 'run_id'
+                            log_debug(f"Found partial match for run ID {run_id} -> {run.run_id}")
+                            break
+            
+            if target_run is None:
+                log_warning(f"Could not find run with ID {run_id} in session {source_session_id}")
+                return None
+            
+            # Get the timestamp of the target run
+            target_timestamp = None
+            if hasattr(target_run, 'created_at'):
+                target_timestamp = target_run.created_at
+            else:
+                log_warning(f"Run with ID {run_id} does not have a created_at timestamp")
+                return None
+            
+            # Copy the runs up to and including the target run
+            if hasattr(self.memory, 'runs') and isinstance(self.memory.runs, dict):
+                if source_session_id in self.memory.runs:
+                    source_runs = self.memory.runs[source_session_id]
+                    filtered_runs = []
+                    
+                    for run in source_runs:
+                        # Deep copy the run to avoid modifying the original
+                        run_copy = deepcopy(run)
+                        
+                        # Update the session_id to the new session
+                        if hasattr(run_copy, 'session_id'):
+                            run_copy.session_id = new_session_id
+                        
+                        filtered_runs.append(run_copy)
+                        
+                        # Stop after we've copied the target run, using the same attribute that matched
+                        if run_id_attr == 'id' and hasattr(run, 'id') and run.id == run_id:
+                            break
+                        elif run_id_attr == 'run_id' and hasattr(run, 'run_id') and run.run_id == run_id:
+                            break
+                    
+                    # Set the filtered runs for the new session
+                    self.memory.runs = {new_session_id: filtered_runs}
+                    log_debug(f"Copied {len(filtered_runs)} runs to new session {new_session_id}")
+            
+            # Copy the messages up to the target timestamp
+            if hasattr(self.memory, 'messages') and isinstance(self.memory.messages, dict):
+                if source_session_id in self.memory.messages:
+                    source_messages = self.memory.messages[source_session_id]
+                    filtered_messages = []
+                    
+                    for msg in source_messages:
+                        if hasattr(msg, 'created_at') and msg.created_at <= target_timestamp:
+                            # Deep copy the message to avoid modifying the original
+                            msg_copy = deepcopy(msg)
+                            # Update the session_id to the new session if it has this attribute
+                            if hasattr(msg_copy, 'session_id'):
+                                msg_copy.session_id = new_session_id
+                            filtered_messages.append(msg_copy)
+                    
+                    # Set the filtered messages for the new session
+                    self.memory.messages = {new_session_id: filtered_messages}
+                    log_debug(f"Copied {len(filtered_messages)} messages to new session {new_session_id}")
+            
+            # Copy team context if it exists
+            if hasattr(self.memory, 'team_context') and isinstance(self.memory.team_context, dict):
+                if source_session_id in self.memory.team_context:
+                    source_context = self.memory.team_context[source_session_id]
+                    self.memory.team_context = {new_session_id: deepcopy(source_context)}
+                    log_debug(f"Copied team context to new session {new_session_id}")
+            
+            # Handle any other session-specific data structures
+            for attr_name in dir(self.memory):
+                # Skip already handled attributes and private attributes
+                if attr_name in ['runs', 'messages', 'team_context'] or attr_name.startswith('_'):
+                    continue
+                    
+                attr = getattr(self.memory, attr_name)
+                if isinstance(attr, dict) and source_session_id in attr:
+                    # Copy the attribute for the new session
+                    setattr(self.memory, attr_name, {new_session_id: deepcopy(attr[source_session_id])})
+                    log_debug(f"Copied {attr_name} to new session {new_session_id}")
+        
+        try:
+            # Set the session state to the target state
+            self.session_state = target_state
+            self.session_id = new_session_id
+            
+            # Write the new session to storage
+            self.write_to_storage(session_id=new_session_id, user_id=source_session.user_id)
+            
+            log_debug(f"Successfully created new session {new_session_id} from session {source_session_id} at run {run_id}")
+            return new_session_id
+        except Exception as e:
+            log_warning(f"Failed to create session from history: {e}")
+            # Add more detailed error information for debugging
+            import traceback
+            log_debug(f"Error details: {traceback.format_exc()}")
+            return None
+        finally:
+            # Restore the original session state, ID, and memory
+            self.session_state = original_session_state
+            self.session_id = original_session_id
+            if original_memory is not None:
+                self.memory = original_memory
 
     def get_user_memories(self, user_id: Optional[str] = None):
         """Get the user memories for the given user ID."""
