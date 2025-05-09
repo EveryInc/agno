@@ -655,6 +655,7 @@ class Team:
                     _tools.append(self.get_member_information)
 
             elif self.mode == "coordinate":
+                user_message_for_tool = self._get_user_message(message, audio=audio, images=images, videos=videos, files=files) # Get user message
                 _tools.append(
                     self.get_transfer_task_function(
                         session_id=session_id,
@@ -664,6 +665,7 @@ class Team:
                         videos=videos,  # type: ignore
                         audio=audio,  # type: ignore
                         files=files,  # type: ignore
+                        original_message_obj=user_message_for_tool, # Pass it here
                     )
                 )
                 if self.get_member_information_tool:
@@ -1396,6 +1398,7 @@ class Team:
                 _tools.append(forward_task_func)
                 self.model.tool_choice = "required"  # type: ignore
             elif self.mode == "coordinate":
+                user_message_for_tool = self._get_user_message(message, audio=audio, images=images, videos=videos, files=files) # Get user message
                 _tools.append(
                     self.get_transfer_task_function(
                         session_id=session_id,
@@ -1405,6 +1408,7 @@ class Team:
                         videos=videos,  # type: ignore
                         audio=audio,  # type: ignore
                         files=files,  # type: ignore
+                        original_message_obj=user_message_for_tool, # Pass it here
                     )
                 )
                 self.model.tool_choice = "auto"  # type: ignore
@@ -1941,7 +1945,6 @@ class Team:
                     messages_for_memory.append(_rm)
             if len(messages_for_memory) > 0:
                 self.memory.add_messages(messages=messages_for_memory)
-
             team_run = TeamRun(response=run_response)
             team_run.message = run_messages.user_message
 
@@ -4476,10 +4479,11 @@ class Team:
                 "- You can either respond directly or transfer tasks to members in your team with the highest likelihood of completing the user's request.\n"
                 "- Carefully analyze the tools available to the members and their roles before transferring tasks.\n"
                 "- You cannot use a member tool directly. You can only transfer tasks to members.\n"
-                "- When you transfer a task to another member, make sure to include:\n"
+                "- When you transfer a task to another member using the `transfer_task_to_member` tool, make sure to include:\n"
                 "  - member_id (str): The ID of the member to forward the task to.\n"
-                "  - task_description (str): A clear description of the task.\n"
-                "  - expected_output (str): The expected output.\n"
+                "  - task_description (str): A clear description of the task. If `use_original_message` is true, this description will be appended as a '[Coordinator's Note: ...]' to the original user message.\n"
+                "  - expected_output (str): The expected output from the member (optional).\n"
+                "  - use_original_message (bool): Optional. Set to true to send the original user query and its media directly to the member. If true, the `task_description` will serve as an additional note. Defaults to false (meaning `task_description` is the primary message sent).\n"
                 "- You can transfer tasks to multiple members at once.\n"
                 "- You must always analyze the responses from members before responding to the user.\n"
                 "- After analyzing the responses from the members, if you feel the task has been completed, you can stop and respond to the user.\n"
@@ -4612,6 +4616,7 @@ class Team:
         # Format the system message with the session state variables
         if self.add_state_in_messages:
             system_message_content = self._format_message_with_state_variables(system_message_content, user_id=user_id)
+
 
         system_message_from_model = self.model.get_system_message_for_model()
         if system_message_from_model is not None:
@@ -5324,26 +5329,25 @@ class Team:
         videos: Optional[List[Video]] = None,
         audio: Optional[List[Audio]] = None,
         files: Optional[List[File]] = None,
+        original_message_obj: Optional[Message] = None,  # Added
     ) -> Function:
-        if not images:
-            images = []
-        if not videos:
-            videos = []
-        if not audio:
-            audio = []
-        if not files:
-            files = []
+        # Initialize media lists if they are None
+        final_images = list(images) if images else []
+        final_videos = list(videos) if videos else []
+        final_audio = list(audio) if audio else []
+        final_files = list(files) if files else []
 
         def transfer_task_to_member(
-            member_id: str, task_description: str, expected_output: Optional[str] = None
+            member_id: str, task_description: str, expected_output: Optional[str] = None, use_original_message: bool = False
         ) -> Iterator[str]:
             """Use this function to transfer a task to the selected team member.
             You must provide a clear and concise description of the task the member should achieve AND the expected output.
 
             Args:
                 member_id (str): The ID of the member to transfer the task to.
-                task_description (str): A clear and concise description of the task the member should achieve.
+                task_description (str): A clear and concise description of the task the member should achieve. If use_original_message is true, this will be added as a coordinator's note.
                 expected_output (str): The expected output from the member (optional).
+                use_original_message (bool): If true, send the original user query and its media to the member instead of a new task_description and passed media. Defaults to false.
             Returns:
                 str: The result of the delegated task.
             """
@@ -5357,56 +5361,82 @@ class Team:
             member_agent_index, member_agent = result
             self._initialize_member(member_agent, session_id=session_id)
 
-            # 2. Determine team context to send
+            current_images = list(final_images)
+            current_videos = list(final_videos)
+            current_audio = list(final_audio)
+            current_files = list(final_files)
+
+            # Determine team context to send
+            team_context_str: Optional[str] = None
+            team_member_interactions_str: Optional[str] = None
+
             if isinstance(self.memory, TeamMemory):
                 self.memory = cast(TeamMemory, self.memory)
-                team_context_str = None
                 if self.enable_agentic_context:
                     team_context_str = self.memory.get_team_context_str()
-
-                team_member_interactions_str = None
                 if self.share_member_interactions:
                     team_member_interactions_str = self.memory.get_team_member_interactions_str()
                     if context_images := self.memory.get_team_context_images():
-                        images.extend([Image.from_artifact(img) for img in context_images])
+                        current_images.extend([Image.from_artifact(img) for img in context_images])
                     if context_videos := self.memory.get_team_context_videos():
-                        videos.extend([Video.from_artifact(vid) for vid in context_videos])
+                        current_videos.extend([Video.from_artifact(vid) for vid in context_videos])
                     if context_audio := self.memory.get_team_context_audio():
-                        audio.extend([Audio.from_artifact(aud) for aud in context_audio])
-            else:
+                        current_audio.extend([Audio.from_artifact(aud) for aud in context_audio])
+            elif isinstance(self.memory, Memory): # V2 Memory
                 self.memory = cast(Memory, self.memory)
-                team_context_str = None
                 if self.enable_agentic_context:
-                    team_context_str = self.memory.get_team_context_str(session_id=session_id)  # type: ignore
-
-                team_member_interactions_str = None
+                    team_context_str = self.memory.get_team_context_str(session_id=session_id)
                 if self.share_member_interactions:
-                    team_member_interactions_str = self.memory.get_team_member_interactions_str(session_id=session_id)  # type: ignore
-                    if context_images := self.memory.get_team_context_images(session_id=session_id):  # type: ignore
-                        images.extend([Image.from_artifact(img) for img in context_images])
-                    if context_videos := self.memory.get_team_context_videos(session_id=session_id):  # type: ignore
-                        videos.extend([Video.from_artifact(vid) for vid in context_videos])
-                    if context_audio := self.memory.get_team_context_audio(session_id=session_id):  # type: ignore
-                        audio.extend([Audio.from_artifact(aud) for aud in context_audio])
+                    team_member_interactions_str = self.memory.get_team_member_interactions_str(session_id=session_id)
+                    if context_images := self.memory.get_team_context_images(session_id=session_id):
+                        current_images.extend([Image.from_artifact(img) for img in context_images])
+                    if context_videos := self.memory.get_team_context_videos(session_id=session_id):
+                        current_videos.extend([Video.from_artifact(vid) for vid in context_videos])
+                    if context_audio := self.memory.get_team_context_audio(session_id=session_id):
+                        current_audio.extend([Audio.from_artifact(aud) for aud in context_audio])
 
-            # 3. Create the member agent task
-            member_agent_task = "You are a member of a team of agents. Your goal is to complete the following task:"
-            member_agent_task += f"\n\n<task>\n{task_description}\n</task>"
+
+            # Create the member agent task content
+            member_agent_task_content: str
+            task_for_context: str # For logging interaction in memory
+
+            if use_original_message and original_message_obj is not None:
+                member_agent_task_content = original_message_obj.get_content_string()
+                task_for_context = member_agent_task_content
+                # if task_description and task_description.strip():
+                    # note = f"\n\n[Coordinator's Note: {task_description}]"
+                    # member_agent_task_content += note
+                    # task_for_context += note # also add to context if provided
+                # Use media from original_message_obj
+                current_images = list(original_message_obj.images) if original_message_obj.images else []
+                current_videos = list(original_message_obj.videos) if original_message_obj.videos else []
+                current_audio = list(original_message_obj.audio) if original_message_obj.audio else []
+                current_files = list(original_message_obj.files) if original_message_obj.files else []
+
+            elif not task_description or not task_description.strip():
+                yield "Error: A task_description is required when use_original_message is false or the original message is not available."
+                return
+            else:
+                member_agent_task_content = task_description
+                task_for_context = task_description
+
+
+            member_agent_task_str = "You are a member of a team of agents. Your goal is to complete the following task:"
+            member_agent_task_str += f"\n\n<task>\n{member_agent_task_content}\n</task>"
 
             if expected_output is not None:
-                member_agent_task += f"\n\n<expected_output>\n{expected_output}\n</expected_output>"
+                member_agent_task_str += f"\n\n<expected_output>\n{expected_output}\n</expected_output>"
 
             if team_context_str:
-                member_agent_task += f"\n\n{team_context_str}"
+                member_agent_task_str += f"\n\n{team_context_str}"
             if team_member_interactions_str:
-                member_agent_task += f"\n\n{team_member_interactions_str}"
+                member_agent_task_str += f"\n\n{team_member_interactions_str}"
 
-            # Make sure for the member agent, we are using the agent logger
             use_agent_logger()
 
             if stream:
                 member_agent_run_response_stream = member_agent.run(
-                    member_agent_task, images=images, videos=videos, audio=audio, files=files, stream=True
+                    member_agent_task_str, images=current_images, videos=current_videos, audio=current_audio, files=current_files, stream=True
                 )
                 for member_agent_run_response_chunk in member_agent_run_response_stream:
                     check_if_run_cancelled(member_agent_run_response_chunk)
@@ -5419,9 +5449,8 @@ class Team:
                         yield ",".join([tool.get("content", "") for tool in member_agent_run_response_chunk.tools])
             else:
                 member_agent_run_response = member_agent.run(
-                    member_agent_task, images=images, videos=videos, audio=audio, files=files, stream=False
+                    member_agent_task_str, images=current_images, videos=current_videos, audio=current_audio, files=current_files, stream=False
                 )
-
                 check_if_run_cancelled(member_agent_run_response)
 
                 if member_agent_run_response.content is None and (
@@ -5431,71 +5460,58 @@ class Team:
                 elif isinstance(member_agent_run_response.content, str):
                     if len(member_agent_run_response.content.strip()) > 0:
                         yield member_agent_run_response.content
-
-                    # If the content is empty but we have tool calls
                     elif member_agent_run_response.tools is not None and len(member_agent_run_response.tools) > 0:
                         yield ",".join([tool.get("content", "") for tool in member_agent_run_response.tools])
-
                 elif issubclass(type(member_agent_run_response.content), BaseModel):
                     try:
-                        yield member_agent_run_response.content.model_dump_json(indent=2)  # type: ignore
+                        yield member_agent_run_response.content.model_dump_json(indent=2)
                     except Exception as e:
                         yield str(e)
                 else:
                     try:
                         import json
-
                         yield json.dumps(member_agent_run_response.content, indent=2)
                     except Exception as e:
                         yield str(e)
 
-            # Afterward, switch back to the team logger
             use_team_logger()
 
-            # Update the memory
             member_name = member_agent.name if member_agent.name else f"agent_{member_agent_index}"
-
             if isinstance(self.memory, TeamMemory):
-                self.memory = cast(TeamMemory, self.memory)
                 self.memory.add_interaction_to_team_context(
                     member_name=member_name,
-                    task=task_description,
-                    run_response=member_agent.run_response,  # type: ignore
+                    task=task_for_context, # Use the actual content sent for context
+                    run_response=member_agent.run_response,
                 )
-            else:
-                self.memory = cast(Memory, self.memory)
-                self.memory.add_interaction_to_team_context(
+            elif isinstance(self.memory, Memory): # V2 Memory
+                 self.memory.add_interaction_to_team_context(
                     session_id=session_id,
                     member_name=member_name,
-                    task=task_description,
-                    run_response=member_agent.run_response,  # type: ignore
+                    task=task_for_context, # Use the actual content sent for context
+                    run_response=member_agent.run_response,
                 )
 
-            # Add the member run to the team run response
-            self.run_response = cast(TeamRunResponse, self.run_response)
-            self.run_response.add_member_run(member_agent.run_response)  # type: ignore
+            if self.run_response:
+                 self.run_response.add_member_run(member_agent.run_response) # type: ignore
 
-            # Update team session state
             self._update_team_session_state(member_agent)
-
-            # Update the team media
-            self._update_team_media(member_agent.run_response)  # type: ignore
+            self._update_team_media(member_agent.run_response) # type: ignore
 
         async def atransfer_task_to_member(
-            member_id: str, task_description: str, expected_output: Optional[str] = None
+            member_id: str, task_description: str, expected_output: Optional[str] = None, use_original_message: bool = False
         ) -> AsyncIterator[str]:
             """Use this function to transfer a task to the selected team member.
             You must provide a clear and concise description of the task the member should achieve AND the expected output.
 
             Args:
                 member_id (str): The ID of the member to transfer the task to.
-                task_description (str): A clear and concise description of the task the member should achieve.
+                task_description (str): A clear and concise description of the task the member should achieve. If use_original_message is true, this will be added as a coordinator's note.
                 expected_output (str): The expected output from the member (optional).
+                use_original_message (bool): If true, send the original user query and its media to the member instead of a new task_description and passed media. Defaults to false.
             Returns:
                 str: The result of the delegated task.
             """
 
-            # Find the member agent using the helper function
             result = self._find_member_by_id(member_id)
             if result is None:
                 yield f"Member with ID {member_id} not found in the team or any subteams. Please choose the correct member from the list of members:\n\n{self.get_members_system_message_content(indent=0)}"
@@ -5504,56 +5520,76 @@ class Team:
             member_agent_index, member_agent = result
             self._initialize_member(member_agent, session_id=session_id)
 
-            # 2. Determine team context to send
+            current_images = list(final_images)
+            current_videos = list(final_videos)
+            current_audio = list(final_audio)
+            current_files = list(final_files)
+
+            team_context_str: Optional[str] = None
+            team_member_interactions_str: Optional[str] = None
+
             if isinstance(self.memory, TeamMemory):
                 self.memory = cast(TeamMemory, self.memory)
-                team_context_str = None
                 if self.enable_agentic_context:
                     team_context_str = self.memory.get_team_context_str()
-
-                team_member_interactions_str = None
                 if self.share_member_interactions:
                     team_member_interactions_str = self.memory.get_team_member_interactions_str()
                     if context_images := self.memory.get_team_context_images():
-                        images.extend([Image.from_artifact(img) for img in context_images])
+                        current_images.extend([Image.from_artifact(img) for img in context_images])
                     if context_videos := self.memory.get_team_context_videos():
-                        videos.extend([Video.from_artifact(vid) for vid in context_videos])
+                        current_videos.extend([Video.from_artifact(vid) for vid in context_videos])
                     if context_audio := self.memory.get_team_context_audio():
-                        audio.extend([Audio.from_artifact(aud) for aud in context_audio])
-            else:
+                        current_audio.extend([Audio.from_artifact(aud) for aud in context_audio])
+            elif isinstance(self.memory, Memory): # V2 Memory
                 self.memory = cast(Memory, self.memory)
-                team_context_str = None
                 if self.enable_agentic_context:
-                    team_context_str = self.memory.get_team_context_str(session_id=session_id)  # type: ignore
-
-                team_member_interactions_str = None
+                    team_context_str = self.memory.get_team_context_str(session_id=session_id)
                 if self.share_member_interactions:
-                    team_member_interactions_str = self.memory.get_team_member_interactions_str(session_id=session_id)  # type: ignore
-                    if context_images := self.memory.get_team_context_images(session_id=session_id):  # type: ignore
-                        images.extend([Image.from_artifact(img) for img in context_images])
-                    if context_videos := self.memory.get_team_context_videos(session_id=session_id):  # type: ignore
-                        videos.extend([Video.from_artifact(vid) for vid in context_videos])
-                    if context_audio := self.memory.get_team_context_audio(session_id=session_id):  # type: ignore
-                        audio.extend([Audio.from_artifact(aud) for aud in context_audio])
+                    team_member_interactions_str = self.memory.get_team_member_interactions_str(session_id=session_id)
+                    if context_images := self.memory.get_team_context_images(session_id=session_id):
+                        current_images.extend([Image.from_artifact(img) for img in context_images])
+                    if context_videos := self.memory.get_team_context_videos(session_id=session_id):
+                        current_videos.extend([Video.from_artifact(vid) for vid in context_videos])
+                    if context_audio := self.memory.get_team_context_audio(session_id=session_id):
+                        current_audio.extend([Audio.from_artifact(aud) for aud in context_audio])
 
-            # 3. Create the member agent task
-            member_agent_task = "You are a member of a team of agents. Your goal is to complete the following task:"
-            member_agent_task += f"\n\n<task>\n{task_description}\n</task>"
+            member_agent_task_content: str
+            task_for_context: str
+
+            if use_original_message and original_message_obj is not None:
+                member_agent_task_content = original_message_obj.get_content_string()
+                task_for_context = member_agent_task_content
+                if task_description and task_description.strip():
+                    note = f"\n\n[Coordinator's Note: {task_description}]"
+                    member_agent_task_content += note
+                    task_for_context += note
+                current_images = list(original_message_obj.images) if original_message_obj.images else []
+                current_videos = list(original_message_obj.videos) if original_message_obj.videos else []
+                current_audio = list(original_message_obj.audio) if original_message_obj.audio else []
+                current_files = list(original_message_obj.files) if original_message_obj.files else []
+            elif not task_description or not task_description.strip():
+                yield "Error: A task_description is required when use_original_message is false or the original message is not available."
+                return
+            else:
+                member_agent_task_content = task_description
+                task_for_context = task_description
+
+            member_agent_task_str = "You are a member of a team of agents. Your goal is to complete the following task:"
+            member_agent_task_str += f"\n\n<task>\n{member_agent_task_content}\n</task>"
 
             if expected_output is not None:
-                member_agent_task += f"\n\n<expected_output>\n{expected_output}\n</expected_output>"
+                member_agent_task_str += f"\n\n<expected_output>\n{expected_output}\n</expected_output>"
 
             if team_context_str:
-                member_agent_task += f"\n\n{team_context_str}"
+                member_agent_task_str += f"\n\n{team_context_str}"
             if team_member_interactions_str:
-                member_agent_task += f"\n\n{team_member_interactions_str}"
+                member_agent_task_str += f"\n\n{team_member_interactions_str}"
 
-            # Make sure for the member agent, we are using the agent logger
             use_agent_logger()
 
             if stream:
                 member_agent_run_response_stream = await member_agent.arun(
-                    member_agent_task, images=images, videos=videos, audio=audio, files=files, stream=True
+                    member_agent_task_str, images=current_images, videos=current_videos, audio=current_audio, files=current_files, stream=True
                 )
                 async for member_agent_run_response_chunk in member_agent_run_response_stream:
                     check_if_run_cancelled(member_agent_run_response_chunk)
@@ -5566,7 +5602,7 @@ class Team:
                         yield ",".join([tool.get("content", "") for tool in member_agent_run_response_chunk.tools])
             else:
                 member_agent_run_response = await member_agent.arun(
-                    member_agent_task, images=images, videos=videos, audio=audio, files=files, stream=False
+                    member_agent_task_str, images=current_images, videos=current_videos, audio=current_audio, files=current_files, stream=False
                 )
                 check_if_run_cancelled(member_agent_run_response)
 
@@ -5577,63 +5613,49 @@ class Team:
                 elif isinstance(member_agent_run_response.content, str):
                     if len(member_agent_run_response.content.strip()) > 0:
                         yield member_agent_run_response.content
-
-                    # If the content is empty but we have tool calls
                     elif member_agent_run_response.tools is not None and len(member_agent_run_response.tools) > 0:
                         yield ",".join([tool.get("content", "") for tool in member_agent_run_response.tools])
                 elif issubclass(type(member_agent_run_response.content), BaseModel):
                     try:
-                        yield member_agent_run_response.content.model_dump_json(indent=2)  # type: ignore
+                        yield member_agent_run_response.content.model_dump_json(indent=2)
                     except Exception as e:
                         yield str(e)
                 else:
                     try:
                         import json
-
                         yield json.dumps(member_agent_run_response.content, indent=2)
                     except Exception as e:
                         yield str(e)
 
-            # Afterward, switch back to the team logger
             use_team_logger()
-
-            # Update the memory
             member_name = member_agent.name if member_agent.name else f"agent_{member_agent_index}"
+
             if isinstance(self.memory, TeamMemory):
-                self.memory = cast(TeamMemory, self.memory)
                 self.memory.add_interaction_to_team_context(
                     member_name=member_name,
-                    task=task_description,
-                    run_response=member_agent.run_response,  # type: ignore
+                    task=task_for_context,
+                    run_response=member_agent.run_response,
                 )
-            else:
-                self.memory = cast(Memory, self.memory)
+            elif isinstance(self.memory, Memory): # V2 Memory
                 self.memory.add_interaction_to_team_context(
                     session_id=session_id,
                     member_name=member_name,
-                    task=task_description,
-                    run_response=member_agent.run_response,  # type: ignore
+                    task=task_for_context,
+                    run_response=member_agent.run_response,
                 )
+            if self.run_response:
+                self.run_response.add_member_run(member_agent.run_response) # type: ignore
 
-            # Add the member run to the team run response
-            self.run_response = cast(TeamRunResponse, self.run_response)
-            self.run_response.add_member_run(member_agent.run_response)  # type: ignore
-
-            # Update team session state
             self._update_team_session_state(member_agent)
-
-            # Update the team media
-            self._update_team_media(member_agent.run_response)  # type: ignore
+            self._update_team_media(member_agent.run_response) # type: ignore
 
         if async_mode:
-            transfer_function = atransfer_task_to_member  # type: ignore
+            transfer_function = atransfer_task_to_member
         else:
-            transfer_function = transfer_task_to_member  # type: ignore
+            transfer_function = transfer_task_to_member
 
         transfer_func = Function.from_callable(transfer_function, strict=True)
-
         return transfer_func
-
     def _get_member_id(self, member: Union[Agent, "Team"]) -> str:
         """
         Get the ID of a member
@@ -6696,3 +6718,4 @@ class Team:
             )
         except Exception as e:
             log_debug(f"Could not create team monitor: {e}")
+
