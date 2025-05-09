@@ -139,6 +139,30 @@ class PostgresStorage(Storage):
         )
 
         return table
+        
+    def get_session_state_history_table_v1(self) -> Table:
+        """
+        Define the table schema for session state history version 1.
+        
+        Returns:
+            Table: SQLAlchemy Table object representing the schema.
+        """
+        from uuid import uuid4
+        
+        # Create table with all columns
+        table = Table(
+            f"{self.table_name}_state_history",
+            self.metadata,
+            Column("id", String, primary_key=True),  # Auto-generated UUID
+            Column("session_id", String, index=True),  # Link to the session
+            Column("run_id", String, index=True),  # Run ID that created this state
+            Column("state", postgresql.JSONB),  # The session state at this point
+            Column("created_at", BigInteger, server_default=text("(extract(epoch from now()))::bigint")),
+            extend_existing=True,
+            schema=self.schema,  # type: ignore
+        )
+        
+        return table
 
     def get_table(self) -> Table:
         """
@@ -183,11 +207,42 @@ class PostgresStorage(Storage):
         except Exception as e:
             logger.error(f"Error checking if table exists: {e}")
             return False
+            
+    def history_table_exists(self) -> bool:
+        """
+        Check if the session state history table exists in the database.
+
+        Returns:
+            bool: True if the history table exists, False otherwise.
+        """
+        try:
+            history_table_name = f"{self.table_name}_state_history"
+            # Use a direct SQL query to check if the table exists
+            with self.Session() as sess:
+                if self.schema is not None:
+                    exists_query = text(
+                        "SELECT 1 FROM information_schema.tables WHERE table_schema = :schema AND table_name = :table"
+                    )
+                    exists = (
+                        sess.execute(exists_query, {"schema": self.schema, "table": history_table_name}).scalar()
+                        is not None
+                    )
+                else:
+                    exists_query = text("SELECT 1 FROM information_schema.tables WHERE table_name = :table")
+                    exists = sess.execute(exists_query, {"table": history_table_name}).scalar() is not None
+
+            log_debug(f"History table '{history_table_name}' does{' not ' if not exists else ' '}exist")
+            return exists
+
+        except Exception as e:
+            logger.error(f"Error checking if history table exists: {e}")
+            return False
 
     def create(self) -> None:
         """
-        Create the table if it does not exist.
+        Create the tables if they do not exist.
         """
+        # Create main table
         self.table = self.get_table()
         if not self.table_exists():
             try:
@@ -239,6 +294,59 @@ class PostgresStorage(Storage):
             except Exception as e:
                 logger.error(f"Could not create table: '{self.table.fullname}': {e}")
                 raise
+                
+        # Create history table
+        history_table = self.get_session_state_history_table_v1()
+        if not self.history_table_exists():
+            try:
+                with self.Session() as sess, sess.begin():
+                    if self.schema is not None and not self.table_exists():
+                        log_debug(f"Creating schema: {self.schema}")
+                        sess.execute(text(f"CREATE SCHEMA IF NOT EXISTS {self.schema};"))
+
+                log_debug(f"Creating history table: {history_table.name}")
+
+                # First create the history table without indexes
+                history_table_without_indexes = Table(
+                    history_table.name,
+                    MetaData(schema=self.schema),
+                    *[c.copy() for c in history_table.columns],
+                    schema=self.schema,
+                )
+                history_table_without_indexes.create(self.db_engine, checkfirst=True)
+
+                # Then create each index individually with error handling
+                for idx in history_table.indexes:
+                    try:
+                        idx_name = idx.name
+                        log_debug(f"Creating index: {idx_name}")
+
+                        # Check if index already exists
+                        with self.Session() as sess:
+                            if self.schema:
+                                exists_query = text(
+                                    "SELECT 1 FROM pg_indexes WHERE schemaname = :schema AND indexname = :index_name"
+                                )
+                                exists = (
+                                    sess.execute(exists_query, {"schema": self.schema, "index_name": idx_name}).scalar()
+                                    is not None
+                                )
+                            else:
+                                exists_query = text("SELECT 1 FROM pg_indexes WHERE indexname = :index_name")
+                                exists = sess.execute(exists_query, {"index_name": idx_name}).scalar() is not None
+
+                        if not exists:
+                            idx.create(self.db_engine)
+                        else:
+                            log_debug(f"Index {idx_name} already exists, skipping creation")
+
+                    except Exception as e:
+                        # Log the error but continue with other indexes
+                        logger.warning(f"Error creating index {idx.name}: {e}")
+
+            except Exception as e:
+                logger.error(f"Could not create history table: '{history_table.name}': {e}")
+                # Don't raise here, as the main table might still be usable
 
     def read(self, session_id: str, user_id: Optional[str] = None) -> Optional[Session]:
         """
@@ -539,6 +647,82 @@ class PostgresStorage(Storage):
             self.metadata = MetaData(schema=self.schema)
             self.table = self.get_table()
 
+    def save_session_state_history(self, session_id: str, run_id: str, state: dict) -> None:
+        """
+        Save a snapshot of session state with the associated run ID.
+        
+        Args:
+            session_id (str): The ID of the session
+            run_id (str): The ID of the run that created this state
+            state (dict): The session state to save
+        """
+        from uuid import uuid4
+        
+        # Make sure the history table exists
+        if not self.history_table_exists():
+            log_debug("History table does not exist, creating it")
+            self.create()
+            
+        try:
+            with self.Session() as sess, sess.begin():
+                # Create a unique ID for this history entry
+                entry_id = str(uuid4())
+                
+                # Get the history table
+                history_table = self.get_session_state_history_table_v1()
+                
+                # Insert the state history entry
+                stmt = postgresql.insert(history_table).values(
+                    id=entry_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    state=state,
+                )
+                sess.execute(stmt)
+                log_debug(f"Saved session state history for session {session_id}, run {run_id}")
+        except Exception as e:
+            log_warning(f"Exception saving session state history: {e}")
+            
+    def get_session_state_history(self, session_id: str, limit: Optional[int] = None) -> List[dict]:
+        """
+        Get the history of session states for a given session.
+        
+        Args:
+            session_id (str): The ID of the session to get history for
+            limit (Optional[int]): Maximum number of history entries to return
+            
+        Returns:
+            List[dict]: List of session state history entries, ordered by creation time (newest first)
+        """
+        # Make sure the history table exists
+        if not self.history_table_exists():
+            log_debug("History table does not exist, no history available")
+            return []
+            
+        try:
+            with self.Session() as sess:
+                history_table = self.get_session_state_history_table_v1()
+                stmt = select(history_table).where(
+                    history_table.c.session_id == session_id
+                ).order_by(history_table.c.created_at.desc())
+                
+                if limit is not None:
+                    stmt = stmt.limit(limit)
+                    
+                result = sess.execute(stmt).fetchall()
+                return [
+                    {
+                        "id": row.id,
+                        "run_id": row.run_id,
+                        "state": row.state,
+                        "created_at": row.created_at
+                    }
+                    for row in result
+                ]
+        except Exception as e:
+            log_warning(f"Exception retrieving session state history: {e}")
+            return []
+    
     def __deepcopy__(self, memo):
         """
         Create a deep copy of the PostgresStorage instance, handling unpickleable attributes.

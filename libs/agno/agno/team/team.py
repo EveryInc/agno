@@ -203,6 +203,8 @@ class Team:
     num_of_interactions_from_history: Optional[int] = None
     # Number of historical runs to include in the messages
     num_history_runs: int = 3
+    # If True, track the history of session state changes
+    enable_session_state_history: bool = False
 
     # --- Team Storage ---
     storage: Optional[Storage] = None
@@ -273,6 +275,7 @@ class Team:
         enable_team_history: bool = False,
         num_of_interactions_from_history: Optional[int] = None,
         num_history_runs: int = 3,
+        enable_session_state_history: bool = False,
         storage: Optional[Storage] = None,
         extra_data: Optional[Dict[str, Any]] = None,
         reasoning: bool = False,
@@ -341,6 +344,7 @@ class Team:
         self.enable_team_history = enable_team_history
         self.num_of_interactions_from_history = num_of_interactions_from_history
         self.num_history_runs = num_history_runs
+        self.enable_session_state_history = enable_session_state_history
 
         self.storage = storage
         self.extra_data = extra_data
@@ -5956,6 +5960,20 @@ class Team:
             Optional[TeamSession]: The saved TeamSession or None if not saved.
         """
         if self.storage is not None:
+            # Save session state history if enabled and we have a run_id and session_state
+            if self.enable_session_state_history and self.run_id is not None and self.session_state is not None and len(self.session_state) > 0:
+                try:
+                    # Save the current session state with the run_id that created it
+                    self.storage.save_session_state_history(
+                        session_id=session_id,
+                        run_id=self.run_id,
+                        state=self.session_state
+                    )
+                    log_debug(f"Saved session state history for session {session_id}, run {self.run_id}")
+                except Exception as e:
+                    log_warning(f"Failed to save session state history: {e}")
+            
+            # Save the session as usual
             self.team_session = cast(
                 TeamSession, self.storage.upsert(session=self._get_team_session(session_id=session_id, user_id=user_id))
             )
@@ -6235,6 +6253,34 @@ class Team:
             raise ValueError("TeamMemory does not support get_session_summary")
         else:
             raise ValueError(f"Memory type {type(self.memory)} not supported")
+            
+    def get_session_state_history(self, session_id: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get the history of session states for the given session ID.
+        
+        Args:
+            session_id (Optional[str]): The session ID to get history for. Defaults to the current session ID.
+            limit (Optional[int]): Maximum number of history entries to return. Defaults to None (all entries).
+            
+        Returns:
+            List[Dict[str, Any]]: List of session state history entries, ordered by creation time (newest first).
+            Each entry contains: id, run_id, state, created_at.
+            
+        Raises:
+            ValueError: If session_id is not provided and not set on the Team.
+        """
+        session_id = session_id if session_id is not None else self.session_id
+        if session_id is None:
+            raise ValueError("Session ID is required")
+            
+        if self.storage is None:
+            log_warning("Storage is not configured, cannot retrieve session state history")
+            return []
+            
+        try:
+            return self.storage.get_session_state_history(session_id=session_id, limit=limit)
+        except Exception as e:
+            log_warning(f"Failed to retrieve session state history: {e}")
+            return []
 
     def get_user_memories(self, user_id: Optional[str] = None):
         """Get the user memories for the given user ID."""

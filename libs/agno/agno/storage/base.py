@@ -49,3 +49,11 @@ class Storage(ABC):
     @abstractmethod
     def upgrade_schema(self) -> None:
         raise NotImplementedError
+        
+    @abstractmethod
+    def save_session_state_history(self, session_id: str, run_id: str, state: dict) -> None:
+        raise NotImplementedError
+        
+    @abstractmethod
+    def get_session_state_history(self, session_id: str, limit: Optional[int] = None) -> List[dict]:
+        raise NotImplementedError
