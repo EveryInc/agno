@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections import ChainMap, defaultdict, deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from os import getenv
 from typing import (
@@ -6286,31 +6287,34 @@ class Team:
         """Create a new session from an existing session up to a specific run ID.
         
         This method creates a new session with the same team configuration as the source session,
-        but with the state as it was at the specified run_id. The new session will be completely
-        independent from the original session.
-        
         Args:
-            source_session_id (str): The ID of the source session to branch from.
-            run_id (str): The run ID up to which to copy the session state.
-            
+            source_session_id: The source session ID
+            run_id: The run ID to create the session from
+
         Returns:
-            Optional[str]: The ID of the newly created session, or None if creation failed.
-            
-        Raises:
-            ValueError: If session state history is not enabled or if the source session is not found.
+            The new session ID if successful, None otherwise
         """
-        if not self.enable_session_state_history:
-            raise ValueError("Session state history must be enabled to create a session from history")
-            
+        # Save the original session state and ID
+        original_session_state = deepcopy(self.session_state) if self.session_state else {}
+        original_session_id = self.session_id
+        original_memory = None
+
+        # Check if storage is configured
         if self.storage is None:
             log_warning("Storage is not configured, cannot create session from history")
             return None
-            
-        # Read the source session
+
+        # Load the source session data first to ensure we have access to all runs
+        current_session_id = self.session_id
+        self.read_from_storage(session_id=source_session_id)
+        log_debug(f"Loaded source session {source_session_id} for branching")
+
+        # Read the source session from storage
         source_session = cast(TeamSession, self.storage.read(session_id=source_session_id))
         if source_session is None:
-            raise ValueError(f"Source session with ID {source_session_id} not found")
-            
+            log_warning(f"Session {source_session_id} not found")
+            return None
+
         # Get the session state history for the source session
         history = self.storage.get_session_state_history(session_id=source_session_id)
         if not history:
@@ -6340,8 +6344,6 @@ class Team:
         
         # If we have a memory object, we need to handle it specially
         if self.memory is not None:
-            from copy import deepcopy
-            
             # Make a deep copy of the memory to preserve the original
             original_memory = deepcopy(self.memory)
             
