@@ -6350,47 +6350,58 @@ class Team:
             # Find the target run to get its timestamp
             target_run = None
             run_id_attr = None  # Track which attribute matched for consistency
+            source_runs = []
             
-            if hasattr(self.memory, 'runs') and isinstance(self.memory.runs, dict):
-                source_runs = self.memory.runs.get(source_session_id, [])
-                
-                # First pass: try to find the exact run ID match
+            if hasattr(self.memory, 'runs'):
+                # Handle case where runs is a dictionary keyed by session_id (non-standard implementation)
+                if isinstance(self.memory.runs, dict):
+                    source_runs = self.memory.runs.get(source_session_id, [])
+                    log_debug(f"Found {len(source_runs)} runs in memory (dict format, session_id: {source_session_id})")
+                # Handle case where runs is a list (standard implementation per TeamMemory class definition)
+                elif isinstance(self.memory.runs, list):
+                    source_runs = self.memory.runs
+                    log_debug(f"Found {len(source_runs)} runs in memory (list format)")
+                else:
+                    log_warning(f"Unexpected type for self.memory.runs: {type(self.memory.runs)}")
+                    return None
+
+            # First pass: try to find the exact run ID match
+            for run in source_runs:
+                # Check both 'id' and 'run_id' attributes since different run objects might use different naming
+                if hasattr(run, 'id') and run.id == run_id:
+                    target_run = run
+                    run_id_attr = 'id'
+                    break
+                elif hasattr(run, 'run_id') and run.run_id == run_id:
+                    target_run = run
+                    run_id_attr = 'run_id'
+                    break
+            
+            # If we didn't find the run, log details and try partial matching
+            if target_run is None:
+                # Collect all available run IDs for debugging
+                run_ids = []
                 for run in source_runs:
-                    # Check both 'id' and 'run_id' attributes since different run objects might use different naming
-                    if hasattr(run, 'id') and run.id == run_id:
+                    if hasattr(run, 'id'):
+                        run_ids.append(f"id:{run.id}")
+                    if hasattr(run, 'run_id'):
+                        run_ids.append(f"run_id:{run.run_id}")
+                
+                log_debug(f"Available run IDs: {run_ids}")
+                log_debug(f"Looking for run ID: {run_id}")
+                
+                # Try partial matching as a fallback
+                for run in source_runs:
+                    if hasattr(run, 'id') and str(run.id).startswith(run_id):
                         target_run = run
                         run_id_attr = 'id'
+                        log_debug(f"Found partial match for run ID {run_id} -> {run.id}")
                         break
-                    elif hasattr(run, 'run_id') and run.run_id == run_id:
+                    elif hasattr(run, 'run_id') and str(run.run_id).startswith(run_id):
                         target_run = run
                         run_id_attr = 'run_id'
+                        log_debug(f"Found partial match for run ID {run_id} -> {run.run_id}")
                         break
-                
-                # If we didn't find the run, log details and try partial matching
-                if target_run is None:
-                    # Collect all available run IDs for debugging
-                    run_ids = []
-                    for run in source_runs:
-                        if hasattr(run, 'id'):
-                            run_ids.append(f"id:{run.id}")
-                        if hasattr(run, 'run_id'):
-                            run_ids.append(f"run_id:{run.run_id}")
-                    
-                    log_debug(f"Available run IDs: {run_ids}")
-                    log_debug(f"Looking for run ID: {run_id}")
-                    
-                    # Try partial matching as a fallback
-                    for run in source_runs:
-                        if hasattr(run, 'id') and str(run.id).startswith(run_id):
-                            target_run = run
-                            run_id_attr = 'id'
-                            log_debug(f"Found partial match for run ID {run_id} -> {run.id}")
-                            break
-                        elif hasattr(run, 'run_id') and str(run.run_id).startswith(run_id):
-                            target_run = run
-                            run_id_attr = 'run_id'
-                            log_debug(f"Found partial match for run ID {run_id} -> {run.run_id}")
-                            break
             
             if target_run is None:
                 log_warning(f"Could not find run with ID {run_id} in session {source_session_id}")
