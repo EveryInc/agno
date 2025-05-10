@@ -6346,6 +6346,8 @@ class Team:
         if self.memory is not None:
             # Make a deep copy of the memory to preserve the original
             original_memory = deepcopy(self.memory)
+            # Store the original memory as an attribute for verification purposes
+            self.original_memory = original_memory
             
             # Find the target run to get its timestamp
             target_run = None
@@ -6367,8 +6369,6 @@ class Team:
 
             # First pass: try to find the exact run ID match
             for run in source_runs:
-                print(run)
-                print("-------")
                 if (run.response.run_id == run_id):
                     target_run = run
                     run_id_attr = 'run_id'
@@ -6377,37 +6377,40 @@ class Team:
             if target_run is None:
                 log_warning(f"Could not find run with ID {run_id} in session {source_session_id}")
                 return None
+
             
             # Get the timestamp of the target run
             target_timestamp = target_run.response.created_at
             
             # Copy the runs up to and including the target run
             if isinstance(self.memory, TeamMemory) and hasattr(self.memory, 'runs') and isinstance(self.memory.runs, list):
-                if source_session_id in self.memory.runs:
-                    source_runs = self.memory.runs
-                    filtered_runs = []
-                    
-                    for run in source_runs:
+                source_runs = self.memory.runs
+                filtered_runs = []
+                
+                # First, find the index of the target run
+                target_index = -1
+                for i, run in enumerate(source_runs):
+                    if hasattr(run, 'response') and run.response.run_id == run_id:
+                        target_index = i
+                        break
+                if target_index >= 0:
+                    # Only copy runs up to and including the target run
+                    for i in range(target_index + 1):
                         # Deep copy the run to avoid modifying the original
-                        run_copy = deepcopy(run)
+                        run_copy = deepcopy(source_runs[i])
                         
-                        # Update the session_id to the new session
+                        # Update the session_id to the new session if needed
                         if hasattr(run_copy, 'session_id'):
                             run_copy.session_id = new_session_id
                         
                         filtered_runs.append(run_copy)
-                        
-                        # Stop after we've copied the target run, using the same attribute that matched
-                        if run_id_attr == 'id' and hasattr(run, 'id') and run.id == run_id:
-                            break
-                        elif run_id_attr == 'run_id' and hasattr(run, 'run_id') and run.run_id == run_id:
-                            break
+                    
+                    log_debug(f"Found target run at index {target_index}, copying {len(filtered_runs)} runs")
                     
                     # Set the filtered runs for the new session
                     self.memory.runs = filtered_runs
                     log_debug(f"Copied {len(filtered_runs)} runs to new session {new_session_id}")
-            
-            # Copy the messages up to the target timestamp
+                        # Copy the messages up to the target timestamp
             if hasattr(self.memory, 'messages') and isinstance(self.memory.messages, dict):
                 if source_session_id in self.memory.messages:
                     source_messages = self.memory.messages[source_session_id]
@@ -6425,26 +6428,6 @@ class Team:
                     # Set the filtered messages for the new session
                     self.memory.messages = filtered_messages
                     log_debug(f"Copied {len(filtered_messages)} messages to new session {new_session_id}")
-            
-            # Copy team context if it exists
-            if hasattr(self.memory, 'team_context') and isinstance(self.memory.team_context, dict):
-                if source_session_id in self.memory.team_context:
-                    source_context = self.memory.team_context[source_session_id]
-                    self.memory.team_context = deepcopy(source_context)
-                    log_debug(f"Copied team context to new session {new_session_id}")
-            
-            # Handle any other session-specific data structures
-            for attr_name in dir(self.memory):
-                # Skip already handled attributes and private attributes
-                if attr_name in ['runs', 'messages', 'team_context'] or attr_name.startswith('_'):
-                    continue
-                    
-                attr = getattr(self.memory, attr_name)
-                if isinstance(attr, dict) and source_session_id in attr:
-                    # Copy the attribute for the new session
-                    setattr(self.memory, attr_name, deepcopy(attr[source_session_id]))
-                    log_debug(f"Copied {attr_name} to new session {new_session_id}")
-        
         try:
             # Set the session state to the target state
             self.session_state = target_state
