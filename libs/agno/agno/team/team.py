@@ -6420,6 +6420,21 @@ class Team:
             # Write the new session to storage
             self.write_to_storage(session_id=new_session_id, user_id=source_session.user_id)
             
+            # Copy the session state history up to and including the target state
+            if self.enable_session_state_history and self.storage is not None and target_index >= 0:
+                # Get the history entries up to and including the target index
+                history_to_copy = history[:target_index + 1]
+                log_debug(f"Copying {len(history_to_copy)} session state history entries to new session")
+                
+                # Save each history entry to the new session
+                for entry in history_to_copy:
+                    self.storage.save_session_state_history(
+                        session_id=new_session_id,
+                        run_id=entry["run_id"],
+                        state=entry["state"]
+                    )
+                log_debug(f"Successfully copied session state history to new session {new_session_id}")
+            
             log_debug(f"Successfully created new session {new_session_id} from session {source_session_id} at run {run_id}")
             return new_session_id
         except Exception as e:
