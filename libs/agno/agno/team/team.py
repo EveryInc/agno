@@ -6411,23 +6411,7 @@ class Team:
                     self.memory.runs = filtered_runs
                     log_debug(f"Copied {len(filtered_runs)} runs to new session {new_session_id}")
                         # Copy the messages up to the target timestamp
-            if hasattr(self.memory, 'messages') and isinstance(self.memory.messages, dict):
-                if source_session_id in self.memory.messages:
-                    source_messages = self.memory.messages[source_session_id]
-                    filtered_messages = []
-                    
-                    for msg in source_messages:
-                        if hasattr(msg, 'created_at') and msg.created_at <= target_timestamp:
-                            # Deep copy the message to avoid modifying the original
-                            msg_copy = deepcopy(msg)
-                            # Update the session_id to the new session if it has this attribute
-                            if hasattr(msg_copy, 'session_id'):
-                                msg_copy.session_id = new_session_id
-                            filtered_messages.append(msg_copy)
-                    
-                    # Set the filtered messages for the new session
-                    self.memory.messages = filtered_messages
-                    log_debug(f"Copied {len(filtered_messages)} messages to new session {new_session_id}")
+            self.memory.messages = []
         try:
             # Set the session state to the target state
             self.session_state = target_state
