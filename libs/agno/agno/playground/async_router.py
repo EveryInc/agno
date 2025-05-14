@@ -519,11 +519,11 @@ def get_async_playground_router(
         try:
             if new_workflow_instance._run_return_type == "RunResponse":
                 # Return as a normal response
-                return new_workflow_instance.run(**body.input)
+                return new_workflow_instance.run_workflow(**body.input)
             else:
                 # Return as a streaming response
                 return StreamingResponse(
-                    (json.dumps(asdict(result)) for result in new_workflow_instance.run(**body.input)),
+                    (json.dumps(asdict(result)) for result in new_workflow_instance.run_workflow(**body.input)),
                     media_type="text/event-stream",
                 )
         except Exception as e:
