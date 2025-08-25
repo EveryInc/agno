@@ -791,6 +791,23 @@ class LiteLLMResponses(Model):
                     model_response.content = delta.content
                     stream_data.response_content += delta.content
 
+                # Handle thinking blocks from Claude streaming
+                if hasattr(delta, 'thinking_blocks') and delta.thinking_blocks:
+                    thinking_parts = []
+                    for thinking_block in delta.thinking_blocks:
+                        if hasattr(thinking_block, 'thinking') and thinking_block.thinking:
+                            thinking_parts.append(thinking_block.thinking)
+                    
+                    if thinking_parts:
+                        thinking_content = '\n'.join(thinking_parts)
+                        model_response.reasoning_content = thinking_content
+                        stream_data.response_thinking += thinking_content
+
+                # Handle reasoning content from GPT-5 streaming
+                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    model_response.reasoning_content = delta.reasoning_content
+                    stream_data.response_thinking += delta.reasoning_content
+
                 if hasattr(delta, 'tool_calls') and delta.tool_calls:
                     # Handle streaming tool calls
                     for tc_delta in delta.tool_calls:
