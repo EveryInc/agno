@@ -23,6 +23,7 @@ except ImportError:
     raise ImportError("`litellm` not installed. Please install it via `pip install litellm`")
 
 
+
 @dataclass
 class LiteLLMResponses(Model):
     """
@@ -103,38 +104,56 @@ class LiteLLMResponses(Model):
     def _validate_parameters(self) -> None:
         """Validate model parameters and fix common configuration issues."""
         from agno.utils.log import log_warning
-        
+
         # GPT-5 specific validations
         if self.id.startswith("gpt-5"):
             if self.temperature is not None:
                 log_warning("GPT-5 models don't support temperature parameter, ignoring")
                 self.temperature = None
-        
+
         # Claude specific validations
         if self.id.startswith("claude-"):
             # Check for thinking configuration
             thinking_enabled = (
-                self.request_params is not None 
+                self.request_params is not None
                 and "thinking" in self.request_params
                 and self.request_params["thinking"].get("type") == "enabled"
             )
-            
+
+            # For Claude Opus 4.1, temperature can only be 1.0 (regardless of thinking mode)
+            # When thinking is disabled, don't set temperature (let it be None)
             if thinking_enabled:
-                # When thinking is enabled, temperature should be 1.0
+                # When thinking is enabled, temperature must be 1.0
                 if self.temperature != 1.0:
                     log_warning("Claude thinking requires temperature=1.0, adjusting automatically")
                     self.temperature = 1.0
-                
-                # Don't use top_p with temperature for Claude
-                if self.top_p is not None:
-                    log_warning("Claude doesn't work well with both temperature and top_p, setting top_p=None")
-                    self.top_p = None
-        
+
+                # Validate thinking budget tokens - minimum is 1024
+                budget_tokens = self.request_params.get("thinking", {}).get("budget_tokens", 1024)
+                if budget_tokens < 1024:
+                    log_warning(f"Claude thinking requires budget_tokens >= 1024, adjusting from {budget_tokens} to 1024")
+                    self.request_params["thinking"]["budget_tokens"] = 1024
+            else:
+                # When thinking is disabled, don't use temperature parameter
+                if self.temperature is not None:
+                    log_warning("Claude Opus 4.1 requires temperature=1.0 when thinking is enabled. For non-thinking mode, removing temperature parameter")
+                    self.temperature = None
+                    
+                # Explicitly disable thinking by setting request_params to disable it
+                if self.request_params is None:
+                    self.request_params = {}
+                self.request_params["thinking"] = {"type": "disabled"}
+
+            # Don't use top_p with temperature for Claude
+            if self.top_p is not None and self.temperature is not None:
+                log_warning("Claude doesn't work well with both temperature and top_p, setting top_p=None")
+                self.top_p = None
+
         # General parameter conflict checks
         if self.temperature is not None and self.top_p is not None:
             if not self.id.startswith("gpt-"):
                 log_warning("Using both temperature and top_p may cause unexpected behavior with some models")
-        
+
         # Reasoning effort validation
         if self.reasoning_effort is not None:
             valid_efforts = ["low", "medium", "high"]
@@ -382,7 +401,7 @@ class LiteLLMResponses(Model):
                         content_list = [{"type": "input_text", "text": message_dict["content"]}]
                     else:
                         content_list = message_dict["content"]
-                    
+
                     for file in message.files:
                         file_part = _format_file_for_message(file)
                         if file_part:
@@ -495,13 +514,44 @@ class LiteLLMResponses(Model):
             # Enable streaming
             request_params["stream"] = True
 
-            yield from self.get_client().responses(
-                input=self._format_messages(messages),
-                **request_params,
-            )
+            # Wrap the streaming iterator to handle OpenAI validation errors
+            if self.id.startswith(("gpt-", "openai/")):
+                yield from self._handle_openai_streaming_validation(
+                    self.get_client().responses(
+                        input=self._format_messages(messages),
+                        **request_params,
+                    )
+                )
+            else:
+                yield from self.get_client().responses(
+                    input=self._format_messages(messages),
+                    **request_params,
+                )
         except Exception as exc:
             log_error(f"Error from LiteLLM Responses API: {exc}")
             raise ModelProviderError(message=str(exc), model_name=self.name, model_id=self.id) from exc
+    
+    def _handle_openai_streaming_validation(self, stream_iterator):
+        """Handle validation errors in OpenAI streaming responses"""
+        from pydantic import ValidationError
+        
+        while True:
+            try:
+                chunk = next(stream_iterator)
+                yield chunk
+            except StopIteration:
+                # End of stream
+                break
+            except ValidationError as e:
+                # Check if this is a known response event validation error
+                error_str = str(e)
+                if ("ResponseCreatedEvent" in error_str or "ResponseInProgressEvent" in error_str or "ResponseCompletedEvent" in error_str) and "Field required" in error_str:
+                    # Log once but continue streaming
+                    log_debug(f"Skipping LiteLLM validation error for OpenAI streaming (known SDK issue): {e}")
+                    continue
+                else:
+                    # Re-raise other validation errors
+                    raise
 
     async def ainvoke_stream(
         self,
@@ -517,7 +567,7 @@ class LiteLLMResponses(Model):
             request_params = self.get_request_params(
                 messages=messages, response_format=response_format, tools=tools, tool_choice=tool_choice
             )
-            
+
             # Enable streaming
             request_params["stream"] = True
 
@@ -590,7 +640,7 @@ class LiteLLMResponses(Model):
                                 if hasattr(content_item, 'type') and content_item.type == "output_text":
                                     if hasattr(content_item, 'text'):
                                         text_parts.append(content_item.text)
-                            
+
                             model_response.content = ''.join(text_parts)
 
                             # Handle citations/annotations if available
@@ -612,20 +662,20 @@ class LiteLLMResponses(Model):
                     elif output.type == "reasoning":
                         # Handle reasoning content (both GPT-5 and Claude formats)
                         reasoning_parts = []
-                        
+
                         # GPT-5 format: has summary field
                         if hasattr(output, 'summary') and output.summary:
                             for summary_item in output.summary:
                                 if hasattr(summary_item, 'text'):
                                     reasoning_parts.append(summary_item.text)
-                        
+
                         # Claude format: has content field like messages
                         elif hasattr(output, 'content') and output.content:
                             for content_item in output.content:
                                 if hasattr(content_item, 'type') and content_item.type == "output_text":
                                     if hasattr(content_item, 'text'):
                                         reasoning_parts.append(content_item.text)
-                        
+
                         if reasoning_parts:
                             model_response.reasoning_content = '\n'.join(reasoning_parts)
 
@@ -652,7 +702,7 @@ class LiteLLMResponses(Model):
             # Fallback: Standard chat completion style response
             choice = response.choices[0]
             message = choice.message if hasattr(choice, 'message') else choice
-            
+
             if hasattr(message, 'content') and message.content is not None:
                 model_response.content = message.content
 
@@ -685,217 +735,37 @@ class LiteLLMResponses(Model):
 
         return model_response
 
-    def _process_stream_response(
-        self,
-        stream_event: Any,
-        assistant_message: Message,
-        stream_data: MessageData,
-        tool_use: Dict[str, Any],
-    ) -> Tuple[Optional[ModelResponse], Dict[str, Any]]:
-        """
-        Common handler for processing stream responses from LiteLLM Responses API.
 
-        Args:
-            stream_event: The streamed response from LiteLLM
-            assistant_message: The assistant message being built
-            stream_data: Data accumulated during streaming
-            tool_use: Current tool use data being built
-
-        Returns:
-            Tuple containing the ModelResponse to yield and updated tool_use dict
-        """
-        model_response = None
-
-        # Handle different types of stream events
-        # The exact event types may vary based on the LiteLLM provider
-        if hasattr(stream_event, 'type'):
-            if stream_event.type == "response.created":
-                model_response = ModelResponse()
-                # Store the response ID for continuity
-                if hasattr(stream_event, 'response') and hasattr(stream_event.response, 'id') and stream_event.response.id:
-                    if stream_data.response_provider_data is None:
-                        stream_data.response_provider_data = {}
-                    stream_data.response_provider_data["response_id"] = stream_event.response.id
-                # Update metrics
-                if not assistant_message.metrics.time_to_first_token:
-                    assistant_message.metrics.set_time_to_first_token()
-
-            elif stream_event.type in ["response.output_text.delta", "content_delta", "text_delta"]:
-                model_response = ModelResponse()
-                # Extract delta content
-                delta_content = ""
-                if hasattr(stream_event, 'delta'):
-                    delta_content = stream_event.delta
-                elif hasattr(stream_event, 'content'):
-                    delta_content = stream_event.content
-                elif hasattr(stream_event, 'text'):
-                    delta_content = stream_event.text
-
-                model_response.content = delta_content
-                stream_data.response_content += delta_content
-
-                if self.reasoning is not None:
-                    model_response.reasoning_content = delta_content
-                    stream_data.response_thinking += delta_content
-
-            elif stream_event.type == "response.output_item.added":
-                if hasattr(stream_event, 'item') and hasattr(stream_event.item, 'type') and stream_event.item.type == "function_call":
-                    item = stream_event.item
-                    tool_use = {
-                        "id": getattr(item, "id", None),
-                        "call_id": getattr(item, "call_id", None) or getattr(item, "id", None),
-                        "type": "function",
-                        "function": {
-                            "name": getattr(item, "name", ""),
-                            "arguments": getattr(item, "arguments", ""),
-                        },
-                    }
-
-            elif stream_event.type in ["response.function_call_arguments.delta", "tool_call_delta"]:
-                if hasattr(stream_event, 'delta') and tool_use:
-                    tool_use["function"]["arguments"] += stream_event.delta
-
-            elif stream_event.type == "response.output_item.done" and tool_use:
-                model_response = ModelResponse()
-                model_response.tool_calls = [tool_use]
-                if assistant_message.tool_calls is None:
-                    assistant_message.tool_calls = []
-                assistant_message.tool_calls.append(tool_use)
-
-                stream_data.extra = stream_data.extra or {}
-                stream_data.extra.setdefault("tool_call_ids", []).append(tool_use["call_id"])
-                tool_use = {}
-
-            elif stream_event.type in ["response.completed", "stream_end"]:
-                model_response = ModelResponse()
-                # Add usage metrics if present
-                if hasattr(stream_event, 'response') and hasattr(stream_event.response, 'usage') and stream_event.response.usage is not None:
-                    model_response.response_usage = stream_event.response.usage
-                elif hasattr(stream_event, 'usage') and stream_event.usage is not None:
-                    model_response.response_usage = stream_event.usage
-
-                if model_response.response_usage:
-                    _add_usage_metrics_to_assistant_message(
-                        assistant_message=assistant_message,
-                        response_usage=model_response.response_usage,
-                    )
-
-        # Handle delta responses that might not have explicit types
-        elif hasattr(stream_event, 'choices') and stream_event.choices:
-            choice = stream_event.choices[0]
-            if hasattr(choice, 'delta'):
-                delta = choice.delta
-                model_response = ModelResponse()
-                has_content = False
-                
-                if hasattr(delta, 'content') and delta.content:
-                    model_response.content = delta.content
-                    stream_data.response_content += delta.content
-                    has_content = True
-
-                # Handle thinking blocks from Claude streaming
-                if hasattr(delta, 'thinking_blocks') and delta.thinking_blocks:
-                    thinking_parts = []
-                    for thinking_block in delta.thinking_blocks:
-                        if hasattr(thinking_block, 'thinking') and thinking_block.thinking:
-                            thinking_parts.append(thinking_block.thinking)
-                    
-                    if thinking_parts:
-                        thinking_content = '\n'.join(thinking_parts)
-                        model_response.thinking = thinking_content
-                        model_response.reasoning_content = thinking_content
-                        stream_data.response_thinking += thinking_content
-                        has_content = True
-
-                # Handle reasoning content from GPT-5 streaming
-                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                    model_response.thinking = delta.reasoning_content
-                    model_response.reasoning_content = delta.reasoning_content
-                    stream_data.response_thinking += delta.reasoning_content
-                    has_content = True
-
-                if hasattr(delta, 'tool_calls') and delta.tool_calls:
-                    # Handle streaming tool calls
-                    for tc_delta in delta.tool_calls:
-                        if hasattr(tc_delta, 'function'):
-                            if hasattr(tc_delta.function, 'arguments') and tc_delta.function.arguments:
-                                tool_use["function"]["arguments"] += tc_delta.function.arguments
-                                has_content = True
-
-                # Only return model_response if it has actual content
-                if not has_content:
-                    model_response = None
-
-        return model_response, tool_use
-
-    def process_response_stream(
-        self,
-        messages: List[Message],
-        assistant_message: Message,
-        stream_data: MessageData,
-        response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-    ) -> Iterator[ModelResponse]:
-        """Process the synchronous response stream."""
-        tool_use: Dict[str, Any] = {}
-
-        for stream_event in self.invoke_stream(
-            messages=messages, tools=tools, response_format=response_format, tool_choice=tool_choice
-        ):
-            model_response, tool_use = self._process_stream_response(
-                stream_event=stream_event,
-                assistant_message=assistant_message,
-                stream_data=stream_data,
-                tool_use=tool_use,
-            )
-
-            if model_response is not None:
-                yield model_response
-
-    async def aprocess_response_stream(
-        self,
-        messages: List[Message],
-        assistant_message: Message,
-        stream_data: MessageData,
-        response_format: Optional[Union[Dict, Type[BaseModel]]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-    ) -> AsyncIterator[ModelResponse]:
-        """Process the asynchronous response stream."""
-        tool_use: Dict[str, Any] = {}
-
-        async for stream_event in self.ainvoke_stream(
-            messages=messages, tools=tools, response_format=response_format, tool_choice=tool_choice
-        ):
-            model_response, tool_use = self._process_stream_response(
-                stream_event=stream_event,
-                assistant_message=assistant_message,
-                stream_data=stream_data,
-                tool_use=tool_use,
-            )
-            if model_response is not None:
-                yield model_response
 
     def parse_provider_response_delta(self, response: Any) -> ModelResponse:
         """
         Parse the streaming provider response delta into ModelResponse objects.
 
+        LiteLLM /responses API uses event-based format similar to OpenAI:
+        - response.output_text.delta: for regular text content
+        - response.reasoning_summary_text.delta: for reasoning/thinking content
+
         Args:
-            response: Raw response chunk from the provider
+            response: Raw response chunk from the provider (ResponseStreamEvent)
 
         Returns:
             ModelResponse: Parsed response delta
         """
         model_response = ModelResponse()
-        
-        # This method is called for each streaming chunk
-        # Implementation varies based on the specific stream format from LiteLLM
-        if hasattr(response, 'content'):
-            model_response.content = response.content
-        elif hasattr(response, 'delta'):
-            model_response.content = response.delta
-        elif hasattr(response, 'text'):
-            model_response.content = response.text
+
+        # Handle LiteLLM /responses API event-based format
+        if hasattr(response, 'type') and response.type:
+            event_type = str(response.type)
+
+            # Handle text content deltas - match the enum value
+            if 'OUTPUT_TEXT_DELTA' in event_type:
+                if hasattr(response, 'delta') and response.delta is not None:
+                    model_response.content = response.delta
+
+            # Handle reasoning/thinking content deltas
+            elif 'REASONING_SUMMARY_TEXT_DELTA' in event_type or 'reasoning_summary_text.delta' in event_type:
+                if hasattr(response, 'delta') and response.delta is not None:
+                    model_response.thinking = response.delta
+                    model_response.reasoning_content = response.delta
 
         return model_response
