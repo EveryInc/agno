@@ -13,7 +13,8 @@ LITELLM_API_KEY = "sk-1234"
 def check_litellm_proxy() -> bool:
     """Check if LiteLLM proxy is available for testing."""
     try:
-        response = requests.get(f"{LITELLM_PROXY_URL}/health", timeout=5)
+        headers = {"Authorization": f"Bearer {LITELLM_API_KEY}"}
+        response = requests.get(f"{LITELLM_PROXY_URL}/health", headers=headers, timeout=5)
         return response.status_code == 200
     except (requests.ConnectionError, requests.Timeout):
         return False

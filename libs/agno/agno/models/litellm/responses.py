@@ -786,10 +786,12 @@ class LiteLLMResponses(Model):
             if hasattr(choice, 'delta'):
                 delta = choice.delta
                 model_response = ModelResponse()
+                has_content = False
                 
                 if hasattr(delta, 'content') and delta.content:
                     model_response.content = delta.content
                     stream_data.response_content += delta.content
+                    has_content = True
 
                 # Handle thinking blocks from Claude streaming
                 if hasattr(delta, 'thinking_blocks') and delta.thinking_blocks:
@@ -800,13 +802,17 @@ class LiteLLMResponses(Model):
                     
                     if thinking_parts:
                         thinking_content = '\n'.join(thinking_parts)
+                        model_response.thinking = thinking_content
                         model_response.reasoning_content = thinking_content
                         stream_data.response_thinking += thinking_content
+                        has_content = True
 
                 # Handle reasoning content from GPT-5 streaming
                 if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    model_response.thinking = delta.reasoning_content
                     model_response.reasoning_content = delta.reasoning_content
                     stream_data.response_thinking += delta.reasoning_content
+                    has_content = True
 
                 if hasattr(delta, 'tool_calls') and delta.tool_calls:
                     # Handle streaming tool calls
@@ -814,6 +820,11 @@ class LiteLLMResponses(Model):
                         if hasattr(tc_delta, 'function'):
                             if hasattr(tc_delta.function, 'arguments') and tc_delta.function.arguments:
                                 tool_use["function"]["arguments"] += tc_delta.function.arguments
+                                has_content = True
+
+                # Only return model_response if it has actual content
+                if not has_content:
+                    model_response = None
 
         return model_response, tool_use
 
